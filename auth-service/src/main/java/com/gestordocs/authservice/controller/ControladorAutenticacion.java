@@ -1,84 +1,102 @@
 package com.gestordocs.authservice.controller;
 
-import com.gestordocs.authservice.model.CredencialesSolicitud;
-import com.gestordocs.authservice.model.UsuarioRespuesta;
-import com.gestordocs.authservice.service.ServicioToken;
+import java.util.List;
+import java.util.Map;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.web.reactive.function.client.WebClient;
-import org.springframework.web.reactive.function.client.WebClientResponseException;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.RestTemplate;
 
-import java.util.Map;
+import com.gestordocs.authservice.model.CredencialesSolicitud;
+import com.gestordocs.authservice.model.UsuarioRespuesta;
+import com.gestordocs.authservice.service.ServicioToken;
 
 @RestController
 @RequestMapping("/api/auth")
 public class ControladorAutenticacion {
 
     private final ServicioToken servicioToken;
-    private final BCryptPasswordEncoder codificadorContrasena;
-    private final WebClient webClientUsuario; 
+    private final BCryptPasswordEncoder codificadorContrasena = new BCryptPasswordEncoder();
+    private final RestTemplate restTemplate = new RestTemplate();
 
-    // Inyección de dependencias
-    public ControladorAutenticacion(
-            ServicioToken servicioToken, 
-            @Value("${app.services.user.url}") String urlServicioUsuario) {
-        
+    @Value("${app.services.user.url}")
+    private String userServiceBaseUrl;
+
+    public ControladorAutenticacion(ServicioToken servicioToken) {
         this.servicioToken = servicioToken;
-        this.codificadorContrasena = new BCryptPasswordEncoder();
-        this.webClientUsuario = WebClient.builder().baseUrl(urlServicioUsuario).build();
     }
 
-    /**
-     * Endpoint: POST /api/auth/login
-     */
     @PostMapping("/login")
     public ResponseEntity<?> iniciarSesion(@RequestBody CredencialesSolicitud credenciales) {
-        
-        UsuarioRespuesta usuarioDb;
-        
+
         try {
-            // 1. Obtener usuario del User Service (Llamada HTTP a http://localhost:3001/api/usuarios/email/{email})
-            usuarioDb = webClientUsuario.get()
-                    .uri("/{email}", credenciales.getEmail()) 
-                    .retrieve()
-                    .bodyToMono(UsuarioRespuesta.class)
-                    .block(); 
-            
-            if (usuarioDb == null || usuarioDb.getPasswordHash() == null) {
-                // Esto ocurriría si la respuesta es 200 OK pero el cuerpo es incompleto o nulo (escenario muy raro)
-                return new ResponseEntity<>(Map.of("error", "Credenciales inválidas: datos de usuario incompletos."), HttpStatus.UNAUTHORIZED);
+            // 1. Llamar al User Service para obtener usuario por email
+            String url = userServiceBaseUrl + "/email/{email}";
+
+            ResponseEntity<UsuarioRespuesta> respuesta =
+                    restTemplate.getForEntity(url, UsuarioRespuesta.class, credenciales.getEmail());
+
+            if (!respuesta.getStatusCode().is2xxSuccessful() || respuesta.getBody() == null) {
+                return new ResponseEntity<>(
+                        Map.of("error", "Credenciales inválidas: usuario no encontrado."),
+                        HttpStatus.UNAUTHORIZED
+                );
             }
-            
-        } catch (WebClientResponseException.NotFound e) {
-            // 2. Manejo de error 404: El User Service dice que el usuario NO existe
-            return new ResponseEntity<>(Map.of("error", "Credenciales inválidas: usuario no encontrado."), HttpStatus.UNAUTHORIZED);
-            
-        } catch (WebClientResponseException e) {
-            // 3. Manejo de otros errores HTTP (ej. 5xx del User Service, que es un error interno)
-            System.err.println("Error HTTP al contactar User Service: " + e.getStatusCode() + " - " + e.getResponseBodyAsString());
-            return new ResponseEntity<>(Map.of("error", "Error interno al contactar el servicio de usuarios."), HttpStatus.INTERNAL_SERVER_ERROR);
-            
+
+            UsuarioRespuesta usuarioDb = respuesta.getBody();
+
+            if (usuarioDb.getPasswordHash() == null) {
+                return new ResponseEntity<>(
+                        Map.of("error", "Credenciales inválidas: datos de usuario incompletos."),
+                        HttpStatus.UNAUTHORIZED
+                );
+            }
+
+            // 2. Verificar la contraseña con BCrypt
+            boolean contrasenaValida =
+                    codificadorContrasena.matches(credenciales.getPassword(), usuarioDb.getPasswordHash());
+
+            if (!contrasenaValida) {
+                return new ResponseEntity<>(
+                        Map.of("error", "Credenciales inválidas: contraseña incorrecta."),
+                        HttpStatus.UNAUTHORIZED
+                );
+            }
+
+            // 3. Generar el Token JWT
+            String token = servicioToken.generarToken(usuarioDb.getId(), usuarioDb.getRolId());
+
+            // 4. Devolver token
+            return ResponseEntity.ok(Map.of(
+                "token", token,
+                "userID", usuarioDb.getId(),
+                "nombres", usuarioDb.getNombres(),
+                "apellidos", usuarioDb.getApellidos(),
+                "email", usuarioDb.getEmail(),
+                "rolId", usuarioDb.getRolId(),
+                "permisos", List.of()
+
+            ));
+
+        } catch (HttpClientErrorException.NotFound e) {
+            return new ResponseEntity<>(
+                    Map.of("error", "Credenciales inválidas: usuario no encontrado."),
+                    HttpStatus.UNAUTHORIZED
+            );
+
         } catch (Exception e) {
-             // 4. Manejo de errores de conexión/red (El servicio 3001 está inalcanzable)
-             System.err.println("Error de conexión/parseo: " + e.getMessage());
-             return new ResponseEntity<>(Map.of("error", "Error de conexión: El servicio de usuarios (3001) es inalcanzable."), HttpStatus.INTERNAL_SERVER_ERROR);
+            e.printStackTrace(); // Para ver detalles en consola
+            return new ResponseEntity<>(
+                    Map.of("error", "Error interno en auth-service."),
+                    HttpStatus.INTERNAL_SERVER_ERROR
+            );
         }
-
-        // 5. Verificar la contraseña
-        // Si llegamos aquí, la conexión funcionó. Ahora se comprueba la clave.
-        if (!codificadorContrasena.matches(credenciales.getPassword(), usuarioDb.getPasswordHash())) {
-            // Contraseña incorrecta
-            return new ResponseEntity<>(Map.of("error", "Credenciales inválidas: contraseña incorrecta."), HttpStatus.UNAUTHORIZED); 
-        }
-
-        // 6. Generar el Token JWT
-        String token = servicioToken.generarToken(usuarioDb.getId(), usuarioDb.getRolId());
-
-        // 7. Devolver el token
-        return ResponseEntity.ok(Map.of("token", token));
     }
 }

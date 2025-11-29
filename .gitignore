@@ -1,0 +1,24 @@
+# Ignorar carpetas de Maven en cualquier subcarpeta
+**/target/
+
+# Archivos de compilación y backups de Maven
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+
+# Logs
+*.log
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+*.classpath
+*.project
+*.settings/
+
+# Sistema
+.DS_Store
+Thumbs.db
